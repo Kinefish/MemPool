@@ -1,6 +1,8 @@
-# ngx内存分配
+# ngx内存管理
 
-## ngx小块内存池分配
+> ngx将`4k`作为大小块内存分配的界限
+
+## 小块内存池分配
 
 `ngx_palloc_small`
 
@@ -91,4 +93,206 @@ ngx_palloc_block(ngx_pool_t *pool, size_t size)
     return m;
 }
 ```
+
+## 大块内存池分配
+
+`ngx_palloc_large`
+
+> 分配的内存、分配头信息的内存	
+
+- 由`malloc`分配大块内存`p`
+- 同时调用`ngx_palloc_small`来分配存储大块内存头信息`typedef xxx ngx_pool_large_t`的内存，意味着信息存在`block`中
+- 用**头插法**将每一个新生成的大块内存的信息插入`pool->large`中
+- 将`p`记录到信息中，如果链表的前`3`个头信息都挂有大内存的地址，就不再遍历了，而是从`block`中生成新的头信息内存，再将这个新的`p`挂到上面
+
+```cpp
+static void *
+ngx_palloc_large(ngx_pool_t *pool, size_t size)
+{
+    void              *p;
+    ngx_uint_t         n;
+    ngx_pool_large_t  *large;
+
+    p = ngx_alloc(size, pool->log);
+    if (p == NULL) {
+        return NULL;
+    }
+
+    n = 0;
+
+    for (large = pool->large; large; large = large->next) {
+        if (large->alloc == NULL) {
+            large->alloc = p;
+            return p;
+        }
+
+        if (n++ > 3) {
+            break;
+        }
+    }
+
+    large = ngx_palloc_small(pool, sizeof(ngx_pool_large_t), 1);
+    if (large == NULL) {
+        ngx_free(p);
+        return NULL;
+    }
+
+    large->alloc = p;
+    large->next = pool->large;
+    pool->large = large;
+
+    return p;
+}
+
+```
+
+## 大块内存释放
+
+> 只释放大内存，不释放小内存，跟场景有关
+
+- 大内存由`malloc`开辟，信息存在`block`中，以便释放的时候能找到
+- 大内存由`free`释放
+
+```cpp
+ngx_int_t
+ngx_pfree(ngx_pool_t *pool, void *p)
+{
+    ngx_pool_large_t  *l;
+
+    for (l = pool->large; l; l = l->next) {
+        if (p == l->alloc) {
+            ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, pool->log, 0,
+                           "free: %p", l->alloc);
+            ngx_free(l->alloc);
+            l->alloc = NULL;
+
+            return NGX_OK;
+        }
+    }
+
+    return NGX_DECLINED;
+}
+```
+
+## 内存池重置
+
+> `ngx`的是一个支持短连接的`http`服务器，当与`client`的连接断开时，可以重置此时的内存池，并等待下一次的连接
+
+`ngx_reset_pool`
+
+- 大块内存调用`free`，大块内存的头信息记录在`block`中
+- 小块内存`block`通过`p->last`的复位进行重置
+
+```cpp
+void
+ngx_reset_pool(ngx_pool_t *pool)
+{
+    ngx_pool_t        *p;
+    ngx_pool_large_t  *l;
+
+    for (l = pool->large; l; l = l->next) {
+        if (l->alloc) {
+            ngx_free(l->alloc);
+        }
+    }
+
+    /*block的重置会浪费一部分空间，因为只有第一个内存池才带有
+    完整的ngx_pool_t信息，其余的block只有ngx_pool_data_t
+    */
+    for (p = pool; p; p = p->d.next) {
+        p->d.last = (u_char *) p + sizeof(ngx_pool_t);
+        p->d.failed = 0;
+    }
+
+    pool->current = pool;
+    pool->chain = NULL;
+    pool->large = NULL;
+}
+```
+
+## 外部资源的释放
+
+> 利用`cb`进行外部资源释放，如果是文件，提供了文件的`cleanup`调用
+
+`ngx_pool_cleanup_add`
+
+- 外部资源头内存同样在`block`中申请
+- 每个头信息用头插法串起来，最后挂在`pool->cleanup`上
+- `cb`和`size`存入头信息中
+
+```cpp
+ngx_pool_cleanup_t *
+ngx_pool_cleanup_add(ngx_pool_t *p, size_t size)
+{
+    ngx_pool_cleanup_t  *c;
+
+    c = ngx_palloc(p, sizeof(ngx_pool_cleanup_t));
+    if (c == NULL) {
+        return NULL;
+    }
+
+    if (size) {
+        c->data = ngx_palloc(p, size);
+        if (c->data == NULL) {
+            return NULL;
+        }
+
+    } else {
+        c->data = NULL;
+    }
+
+    c->handler = NULL;
+    c->next = p->cleanup;
+
+    p->cleanup = c;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, p->log, 0, "add cleanup: %p", c);
+
+    return c;
+}
+```
+
+## 内存池销毁
+
+> 先释放外部资源，再释放大块内存，最后是`block`的释放
+
+`ngx_destroy_pool`
+
+- 先遍历`pool->cleanup`，调用`cb(data)`释放外部资源
+- 再遍历`pool->large`，释放大块内存
+- 最后遍历`pool->d.nxt`，释放每个`block`
+
+```cpp
+void
+ngx_destroy_pool(ngx_pool_t *pool)
+{
+    ngx_pool_t          *p, *n;
+    ngx_pool_large_t    *l;
+    ngx_pool_cleanup_t  *c;
+
+    for (c = pool->cleanup; c; c = c->next) {
+        if (c->handler) {
+            ngx_log_debug1(NGX_LOG_DEBUG_ALLOC, pool->log, 0,
+                           "run cleanup: %p", c);
+            c->handler(c->data);
+        }
+    }
+
+    for (l = pool->large; l; l = l->next) {
+        if (l->alloc) {
+            ngx_free(l->alloc);
+        }
+    }
+
+    for (p = pool, n = pool->d.next; /* void */; p = n, n = n->d.next) {
+        ngx_free(p);
+
+        if (n == NULL) {
+            break;
+        }
+    }
+}
+```
+
+
 
