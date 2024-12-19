@@ -1,6 +1,256 @@
+# SGISTL内存管理
+
+> 在频繁使用小块内存是分配、释放下，很容易产生内存碎片，并且`malloc`出的内存同样带有`cookie`
+>
+> `sgi stl`使用的容器空间配置器和`gnu 2.91`的源码一样，都是使用`align = 8`的自由链表来进行内存空间的分配和释放。
+>
+> 貌似是线程安全的
+
+## 对齐函数
+
+> 两个关键的参数
+>
+> A：`__bytes + (size_t)_ALIGN - 1`
+>
+> B：`(size_t)_ALIGN - 1`
+
+`_S_round_up`
+
+- 通过位运算将`bytes`向上取整`_ALIGN`的倍数
+
+~~~cpp
+static size_t _S_round_up(size_t __bytes) {
+    return A & (~ B);
+}
+~~~
+
+`_S_freelist_index`
+
+- 取`__bytes`在`freelist`中的`index`
+
+```cpp
+static size_t _S_freelist_index(size_t __bytes) {
+    return A / B;
+}
+```
+
+## 内存分配
+
+> 通过维护`_S_free_list`来分配不同的`chunk`
+
+`static void* allocate(size_t __n)`
+
+- 如果`__n`超过`128bytes`，则通过`malloc`进行分配
+
+- 先定位`idx`
+- 如果对应`idx`有空闲`chunk`，将`chunk`返回，同时更新对应`idx`的空闲`chunk`；反之，初始化一组`chunk`（链表形式），再返回第一块空闲`chunk`
+
+```cpp
+/* __n must be > 0      */
+  static void* allocate(size_t __n)
+  {
+    void* __ret = 0;
+	
+    //_MAX_BYTES 128 bytes
+    if (__n > (size_t) _MAX_BYTES) {
+      __ret = malloc_alloc::allocate(__n);
+    }
+    else {
+      _Obj* __STL_VOLATILE* __my_free_list
+          = _S_free_list + _S_freelist_index(__n);
+      // Acquire the lock here with a constructor call.
+      // This ensures that it is released in exit or during stack
+      // unwinding.
+#     ifndef _NOTHREADS
+      /*REFERENCED*/
+      _Lock __lock_instance;
+#     endif
+      _Obj* __RESTRICT __result = *__my_free_list;
+      if (__result == 0)
+        __ret = _S_refill(_S_round_up(__n));
+      else {
+        *__my_free_list = __result -> _M_free_list_link;
+        __ret = __result;
+      }
+    }
+
+    return __ret;
+  };
+```
+
+## 初始化chunk
+
+> 负责将分配好的初始化内存以静态链表的形式连起来，使用静态链表的形式可以更极致的使用内存
+
+`_S_refill`
+
+- 每个`chunk`占`__n bytes`
+
+- 初始化的内存`chunk`通过`_S_chunk_alloc()`返回
+- chunk的大小由`nobjs`决定
+- 只负责将每个`chunk`连接
+
+```cpp
+void*
+__default_alloc_template<__threads, __inst>::_S_refill(size_t __n)
+{
+    int __nobjs = 20;
+    char* __chunk = _S_chunk_alloc(__n, __nobjs);
+    _Obj* __STL_VOLATILE* __my_free_list;
+    _Obj* __result;
+    _Obj* __current_obj;
+    _Obj* __next_obj;
+    int __i;
+
+    if (1 == __nobjs) return(__chunk);
+    __my_free_list = _S_free_list + _S_freelist_index(__n);
+
+    /* Build free list in chunk */
+      __result = (_Obj*)__chunk;
+      *__my_free_list = __next_obj = (_Obj*)(__chunk + __n);
+      for (__i = 1; ; __i++) {
+        __current_obj = __next_obj;
+        __next_obj = (_Obj*)((char*)__next_obj + __n);
+        if (__nobjs - 1 == __i) {
+            __current_obj -> _M_free_list_link = 0;
+            break;
+        } else {
+            __current_obj -> _M_free_list_link = __next_obj;
+        }
+      }
+    return(__result);
+}
+```
+
+## 分配chunk
+
+> 通过递归调用，返回`_S_refill()`需要的起始`chunk`地址，并且会修改`__nobjs`
+>
+> 通过`_S_start_free`、`_S_end_free`、`_S_heap_size`决定分配`chunk`
+
+### 正常情况
+
+- 初始化情况
+- 通过`malloc`分配两倍的`chunks bytes`，默认分配`20`个`chunk`，剩下`20`个`chunk`作为备用。前`20`个`chunk`在`_S_refill()`中连接起来
+
+### 备用情况
+
+- 备用内存的`bytes`通过`_S_end_free - _S_start_free`决定
+- 备用内存可以分割成不同大小的`chunk`
+- 会改变`nobjs`
+- 当备用内存不够分配新的`chunk`时，会重新走初始化`chunk`，但是如果`bytes_left > 0`的话，会在初始化前先将剩余内存（头插法）挂到对应的`idx`下
+
+### 失败情况
+
+> 每次初始化`chunk`都会`malloc`较大的内存空间，所以有可能失败
+
+- 优先查看`idx`后的`_S_free_list`是否由空闲的`chunk`
+- 进入`while(1)`，如果有自己写好的资源释放函数，调用定义好的`handler`释放内存，直到有内存释放为止
+- 如果没有，直接`BAD_ALLOC`异常
+
+`_S_chunk_alloc`
+
+```cpp
+char*
+__default_alloc_template<__threads, __inst>::_S_chunk_alloc(size_t __size, 
+                                                            int& __nobjs)
+{
+    char* __result;
+    size_t __total_bytes = __size * __nobjs;
+    size_t __bytes_left = _S_end_free - _S_start_free;
+
+    if (__bytes_left >= __total_bytes) {//一般是正常情况
+        __result = _S_start_free;
+        _S_start_free += __total_bytes;
+        return(__result);
+    } else if (__bytes_left >= __size) {//备用内存的分配
+        __nobjs = (int)(__bytes_left/__size);
+        __total_bytes = __size * __nobjs;
+        __result = _S_start_free;
+        _S_start_free += __total_bytes;
+        return(__result);
+    } else {//初始化情况，会同时判断剩余bytes和malloc失败的情况
+        size_t __bytes_to_get = 
+	  2 * __total_bytes + _S_round_up(_S_heap_size >> 4);
+        // Try to make use of the left-over piece.
+        if (__bytes_left > 0) {//剩余字节不够分配新的chunk
+            _Obj* __STL_VOLATILE* __my_free_list =
+                        _S_free_list + _S_freelist_index(__bytes_left);
+
+            ((_Obj*)_S_start_free) -> _M_free_list_link = *__my_free_list;
+            *__my_free_list = (_Obj*)_S_start_free;
+        }
+        _S_start_free = (char*)malloc(__bytes_to_get);
+        if (0 == _S_start_free) {
+            size_t __i;
+            _Obj* __STL_VOLATILE* __my_free_list;
+	    _Obj* __p;
+            // Try to make do with what we have.  That can't
+            // hurt.  We do not try smaller requests, since that tends
+            // to result in disaster on multi-process machines.
+            for (__i = __size;//找出空余的chunk，分配给当前
+                 __i <= (size_t) _MAX_BYTES;
+                 __i += (size_t) _ALIGN) {
+                __my_free_list = _S_free_list + _S_freelist_index(__i);
+                __p = *__my_free_list;
+                if (0 != __p) {//找到了空余的chunk
+                    *__my_free_list = __p -> _M_free_list_link;
+                    _S_start_free = (char*)__p;
+                    _S_end_free = _S_start_free + __i;
+                    return(_S_chunk_alloc(__size, __nobjs));
+                    // Any leftover piece will eventually make it to the
+                    // right free list.
+                }
+            }//endif for，找不出空余的chunk
+	    _S_end_free = 0;	// In case of exception.
+            _S_start_free = (char*)malloc_alloc::allocate(__bytes_to_get);//调用handler/抛出异常
+            // This should either throw an
+            // exception or remedy the situation.  Thus we assume it
+            // succeeded.
+        }
+        _S_heap_size += __bytes_to_get;
+        _S_end_free = _S_start_free + __bytes_to_get;
+        return(_S_chunk_alloc(__size, __nobjs));//不同情况的递归调用
+    }
+}
+```
+
+## 内存释放
+
+`deallocate()`
+
+- 如果是通过`malloc`分配的内存，通过`free`释放
+- 因为返还的内存可能没有顺序，所以设计成静态链表会更方便
+- 直接头插法挂在`_S_free_list`上就好
+
+```cpp
+/* __p may not be 0 */
+  static void deallocate(void* __p, size_t __n)
+  {
+    if (__n > (size_t) _MAX_BYTES)
+      malloc_alloc::deallocate(__p, __n);
+    else {
+      _Obj* __STL_VOLATILE*  __my_free_list
+          = _S_free_list + _S_freelist_index(__n);
+      _Obj* __q = (_Obj*)__p;
+
+      // acquire lock
+#       ifndef _NOTHREADS
+      /*REFERENCED*/
+      _Lock __lock_instance;
+#       endif /* _NOTHREADS */
+      __q -> _M_free_list_link = *__my_free_list;
+      *__my_free_list = __q;
+      // lock is released here
+    }
+  }
+```
+
+
+
 # ngx内存管理
 
-> ngx将`4k`作为大小块内存分配的界限
+> `ngx`将`4k`作为大小块内存分配的界限
 
 ## 小块内存池分配
 
@@ -219,6 +469,7 @@ ngx_reset_pool(ngx_pool_t *pool)
 - 外部资源头内存同样在`block`中申请
 - 每个头信息用头插法串起来，最后挂在`pool->cleanup`上
 - `cb`和`size`存入头信息中
+- 如果想要通过内存池自动管理外部资源的话，可以传相应的`size`，这样内存池就会开辟相应的`size`，可以通过强转利用这个`size`
 
 ```cpp
 ngx_pool_cleanup_t *

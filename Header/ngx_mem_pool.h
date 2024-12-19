@@ -104,7 +104,7 @@ public:
     u_int ngx_destory_pool();
 
     //add cb, in order to cleanup extern resources
-    clean_up_s* ngx_cleanup_add(size_t size);
+    clean_up_s* ngx_cleanup_add(size_t size = 0);
 
 private:
     ngx_pool_s* _pool;
@@ -120,7 +120,7 @@ namespace ngx_mem_pool_test {
     typedef struct Data stData;
     struct Data {
         char* ptr;
-        FILE* pfile;
+        //FILE* pfile;
     };
     static void func1(void* p1) {
         char* p = (char*)p1;
@@ -128,9 +128,9 @@ namespace ngx_mem_pool_test {
         free(p);
     }
     static void func2(void* pf1) {
-        FILE* pf = (FILE*)pf1;
+        FILE** pf = (FILE** )pf1;
         printf("close file!");
-        fclose(pf);
+        fclose(*pf);
     }
     static void test01() {
         ngx_mem_pool pool;
@@ -144,15 +144,17 @@ namespace ngx_mem_pool_test {
         if (!p2) throw "allocate p2 failed!";
         p2->ptr = (char*)malloc(12);
         strcpy(p2->ptr, "hello world");
-        p2->pfile = fopen("data.txt", "w");
+        
 
-        clean_up_s* c1 = pool.ngx_cleanup_add(sizeof(char*));
+        clean_up_s* c1 = pool.ngx_cleanup_add();
         c1->_cb = func1;
         c1->_data = p2->ptr;
 
         clean_up_s* c2 = pool.ngx_cleanup_add(sizeof(FILE*));
         c2->_cb = func2;
-        c2->_data = p2->pfile;
+
+        FILE** pfile = (FILE **)c2->_data;
+        *pfile = fopen("data.txt", "w");
 
         pool.ngx_destory_pool();
     }
